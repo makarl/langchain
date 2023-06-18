@@ -1,7 +1,8 @@
 """Web base loader class."""
 import asyncio
 import logging
-from typing import Any, List, Optional, Union
+import warnings
+from typing import Any, Dict, List, Optional, Union
 
 import aiohttp
 import requests
@@ -9,7 +10,7 @@ import requests
 from langchain.docstore.document import Document
 from langchain.document_loaders.base import BaseLoader
 
-logger = logging.getLogger(__file__)
+logger = logging.getLogger(__name__)
 
 default_header_template = {
     "User-Agent": "",
@@ -23,6 +24,18 @@ default_header_template = {
 }
 
 
+def _build_metadata(soup: Any, url: str) -> dict:
+    """Build metadata from BeautifulSoup output."""
+    metadata = {"source": url}
+    if title := soup.find("title"):
+        metadata["title"] = title.get_text()
+    if description := soup.find("meta", attrs={"name": "description"}):
+        metadata["description"] = description.get("content", None)
+    if html := soup.find("html"):
+        metadata["language"] = html.get("lang", None)
+    return metadata
+
+
 class WebBaseLoader(BaseLoader):
     """Loader that uses urllib and beautiful soup to load webpages."""
 
@@ -34,8 +47,14 @@ class WebBaseLoader(BaseLoader):
     default_parser: str = "html.parser"
     """Default parser to use for BeautifulSoup."""
 
+    requests_kwargs: Dict[str, Any] = {}
+    """kwargs for requests"""
+
     def __init__(
-        self, web_path: Union[str, List[str]], header_template: Optional[dict] = None
+        self,
+        web_path: Union[str, List[str]],
+        header_template: Optional[dict] = None,
+        verify: Optional[bool] = True,
     ):
         """Initialize with webpage path."""
 
@@ -55,17 +74,22 @@ class WebBaseLoader(BaseLoader):
                 "bs4 package not found, please install it with " "`pip install bs4`"
             )
 
-        try:
-            from fake_useragent import UserAgent
+        # Choose to verify
+        self.verify = verify
 
-            headers = header_template or default_header_template
-            headers["User-Agent"] = UserAgent().random
-            self.session.headers = dict(headers)
-        except ImportError:
-            logger.info(
-                "fake_useragent not found, using default user agent."
-                "To get a realistic header for requests, `pip install fake_useragent`."
-            )
+        headers = header_template or default_header_template
+        if not headers.get("User-Agent"):
+            try:
+                from fake_useragent import UserAgent
+
+                headers["User-Agent"] = UserAgent().random
+            except ImportError:
+                logger.info(
+                    "fake_useragent not found, using default user agent."
+                    "To get a realistic header for requests, "
+                    "`pip install fake_useragent`."
+                )
+        self.session.headers = dict(headers)
 
     @property
     def web_path(self) -> str:
@@ -73,10 +97,26 @@ class WebBaseLoader(BaseLoader):
             raise ValueError("Multiple webpaths found.")
         return self.web_paths[0]
 
-    async def _fetch(self, url: str) -> str:
+    async def _fetch(
+        self, url: str, retries: int = 3, cooldown: int = 2, backoff: float = 1.5
+    ) -> str:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=self.session.headers) as response:
-                return await response.text()
+            for i in range(retries):
+                try:
+                    async with session.get(
+                        url, headers=self.session.headers, verify=self.verify
+                    ) as response:
+                        return await response.text()
+                except aiohttp.ClientConnectionError as e:
+                    if i == retries - 1:
+                        raise
+                    else:
+                        logger.warning(
+                            f"Error fetching {url} with attempt "
+                            f"{i + 1}/{retries}: {e}. Retrying..."
+                        )
+                        await asyncio.sleep(cooldown * backoff**i)
+        raise ValueError("retry count exceeded")
 
     async def _fetch_with_rate_limit(
         self, url: str, semaphore: asyncio.Semaphore
@@ -91,7 +131,15 @@ class WebBaseLoader(BaseLoader):
         for url in urls:
             task = asyncio.ensure_future(self._fetch_with_rate_limit(url, semaphore))
             tasks.append(task)
-        return await asyncio.gather(*tasks)
+        try:
+            from tqdm.asyncio import tqdm_asyncio
+
+            return await tqdm_asyncio.gather(
+                *tasks, desc="Fetching pages", ascii=True, mininterval=1
+            )
+        except ImportError:
+            warnings.warn("For better logging of progress, `pip install tqdm`")
+            return await asyncio.gather(*tasks)
 
     @staticmethod
     def _check_parser(parser: str) -> None:
@@ -131,7 +179,8 @@ class WebBaseLoader(BaseLoader):
 
         self._check_parser(parser)
 
-        html_doc = self.session.get(url)
+        html_doc = self.session.get(url, verify=self.verify, **self.requests_kwargs)
+        html_doc.encoding = html_doc.apparent_encoding
         return BeautifulSoup(html_doc.text, parser)
 
     def scrape(self, parser: Union[str, None] = None) -> Any:
@@ -148,7 +197,7 @@ class WebBaseLoader(BaseLoader):
         for path in self.web_paths:
             soup = self._scrape(path)
             text = soup.get_text()
-            metadata = {"source": path}
+            metadata = _build_metadata(soup, path)
             docs.append(Document(page_content=text, metadata=metadata))
 
         return docs
@@ -159,8 +208,9 @@ class WebBaseLoader(BaseLoader):
         results = self.scrape_all(self.web_paths)
         docs = []
         for i in range(len(results)):
-            text = results[i].get_text()
-            metadata = {"source": self.web_paths[i]}
+            soup = results[i]
+            text = soup.get_text()
+            metadata = _build_metadata(soup, self.web_paths[i])
             docs.append(Document(page_content=text, metadata=metadata))
 
         return docs
